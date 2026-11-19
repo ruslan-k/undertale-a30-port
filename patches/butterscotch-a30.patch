@@ -1,0 +1,299 @@
+diff --git a/src/backends/sdl2.c b/src/backends/sdl2.c
+index 373dbec..0512367 100644
+--- a/src/backends/sdl2.c
++++ b/src/backends/sdl2.c
+@@ -1,4 +1,9 @@
+ #include <ctype.h>
++#include <stdlib.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <errno.h>
++#include <linux/input.h>
+ #include "stdio_compat.h"
+ 
+ #include <SDL2/SDL.h>
+@@ -8,10 +13,20 @@
+ #include "platformdefs.h"
+ #include "gettime.h"
+ #include "runner_mouse.h"
++#include "runner_keyboard.h"
+ 
+ static Runner *g_runner;
+ static SDL_Surface* scr;
+ static SDL_Window *window;
++static SDL_Renderer *rotRenderer = NULL;
++static SDL_Texture *rotTexture = NULL;
++static int rotTexW = 0, rotTexH = 0;
++static bool a30Swap = false, a30SwapReady = false;
++static int a30KeyFd = -1;
++static int a30StickFd = -1;
++static int stickX = 0, stickY = 0;
++static bool escHeld = false;
++static Uint32 escDownAt = 0;
+ static SDL_GameController* openControllers[MAX_GAMEPADS];
+ 
+ static SDL_Window *tryOpenWindow(int reqW, int reqH, const char* title, Uint32 flags) {
+@@ -99,9 +114,13 @@ void platformSetWindowTitle(const char* title) {
+ bool platformGetWindowSize(int32_t* outW, int32_t* outH) {
+     if (!outW || !outH) return false;
+     if (gfx == SOFTWARE) {
+-        if (scr->w <= 0 || scr->h <= 0) return false;
+-        *outW = scr->w;
+-        *outH = scr->h;
++        int w = 0, h = 0;
++        if (scr) { w = scr->w; h = scr->h; }
++        else SDL_GetWindowSize(window, &w, &h);
++        if (w <= 0 || h <= 0) return false;
++        if (a30Swap && a30SwapReady) { int t = w; w = h; h = t; }
++        *outW = w;
++        *outH = h;
+     } else {
+         int w = 0;
+         int h = 0;
+@@ -123,12 +142,14 @@ bool platformGetScaledWindowSize(int32_t* outW, int32_t* outH) {
+     int h = 0;
+     SDL_GetWindowSize(window, &w, &h);
+     if (w <= 0 || h <= 0) return false;
++    if (a30Swap && a30SwapReady) { int t = w; w = h; h = t; }
+     *outW = w;
+     *outH = h;
+     return true;
+ }
+ 
+ static float platformGetWindowScale(void) {
++    if (a30Swap && a30SwapReady) return 1.0f;
+     int32_t draw_w = 0, draw_h = 0;
+     int logical_w, logical_h;
+     platformGetWindowSize(&draw_w, &draw_h);
+@@ -140,9 +161,12 @@ void platformSetWindowSize(int32_t width, int32_t height) {
+     if (width <= 0 || height <= 0) return;
+ 
+     float scale = platformGetWindowScale();
+-    SDL_SetWindowSize(window, (int)(width / scale), (int)(height / scale));
++    if (a30Swap && a30SwapReady)
++        SDL_SetWindowSize(window, (int)(height / scale), (int)(width / scale));
++    else
++        SDL_SetWindowSize(window, (int)(width / scale), (int)(height / scale));
+ 
+-    if (gfx == SOFTWARE)
++    if (gfx == SOFTWARE && scr)
+         scr = SDL_GetWindowSurface(window);
+ }
+ 
+@@ -160,6 +184,13 @@ static bool platformGetWindowFocus(void) {
+ }
+ 
+ bool platformInit(int reqW, int reqH, const char *title, bool headless) {
++    a30Swap = getenv("A30_SWAP") != NULL;
++    // A30 physical buttons are keyboard events on gpio-keys-polled, not on the
++    // virtual SDL joystick. Read them directly like the Spruce emulators do.
++    if (getenv("A30_KEYS") != NULL) {
++        a30KeyFd = open("/dev/input/event3", O_RDONLY | O_NONBLOCK);
++        a30StickFd = open("/dev/input/event4", O_RDONLY | O_NONBLOCK);
++    }
+     // Init SDL
+     if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER|SDL_INIT_GAMECONTROLLER)) {
+         logError("Failed to initialize SDL\n");
+@@ -213,10 +244,21 @@ bool platformInit(int reqW, int reqH, const char *title, bool headless) {
+         SDL_GL_SetSwapInterval(0); // disable vsync
+ #endif
+     } else {
+-        scr = SDL_GetWindowSurface(window);
++        rotRenderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
++        if (!rotRenderer)
++            rotRenderer = SDL_CreateRenderer(window, -1, 0);
++        if (!rotRenderer)
++            rotRenderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
++        if (rotRenderer)
++            logInfo("A30 rotate: SDL renderer ready\n");
++        else {
++            logWarn("A30 rotate: no SDL renderer, falling back to plain blit: %s\n", SDL_GetError());
++            scr = SDL_GetWindowSurface(window);
++        }
+     }
+     // If we don't do this, the window will be larger than it should be on HiDPI displays.
+     platformSetWindowSize(reqW, reqH);
++    a30SwapReady = a30Swap;
+ 
+ #ifndef PLATFORM_VITA
+     // init gamepad mappings
+@@ -226,6 +268,21 @@ bool platformInit(int reqW, int reqH, const char *title, bool headless) {
+     } else {
+         logWarn("Gamepad: SDL gamecontrollerdb.txt not found at %s or failed to load, using defaults\n", dbPath);
+     }
++
++    // A30: a device already present at SDL_Init may have emitted its ADDED event
++    // before the mapping was loaded, leaving the controller permanently closed.
++    {
++        int nj = SDL_NumJoysticks();
++        for (int i = 0; i < nj; i++) {
++            if (!SDL_IsGameController(i)) continue;
++            for (int slot = 0; slot < MAX_GAMEPADS; slot++) {
++                if (!openControllers[slot]) {
++                    openControllers[slot] = SDL_GameControllerOpen(i);
++                    break;
++                }
++            }
++        }
++    }
+ #endif
+ 
+     return true;
+@@ -305,8 +362,32 @@ void platformSetNextFramebuffer(uint32_t* framebuffer, int width, int height) {
+ void platformSwapBuffers(void) {
+ #ifdef ENABLE_SW_RENDERER
+     if(gfx == SOFTWARE) {
+-        SDL_BlitSurface(nextFb, NULL, scr, NULL);
+-        SDL_UpdateWindowSurface(window);
++        if (nextFb && rotRenderer) {
++            if (rotTexture) { SDL_DestroyTexture(rotTexture); rotTexture = NULL; }
++            rotTexture = SDL_CreateTextureFromSurface(rotRenderer, nextFb);
++            if (rotTexture) {
++                SDL_RenderClear(rotRenderer);
++                {
++                    const char *rotEnv = getenv("A30_ROT");
++                    double angle = rotEnv ? atof(rotEnv) : 270.0;
++                    int ow = 0, oh = 0;
++                    if (SDL_GetRendererOutputSize(rotRenderer, &ow, &oh) == 0 && ow > 0 && oh > 0) {
++                        SDL_Rect dst;
++                        dst.x = (ow - oh) / 2;
++                        dst.y = (oh - ow) / 2;
++                        dst.w = oh;
++                        dst.h = ow;
++                        SDL_RenderCopyEx(rotRenderer, rotTexture, NULL, &dst, angle, NULL, SDL_FLIP_NONE);
++                    } else {
++                        SDL_RenderCopyEx(rotRenderer, rotTexture, NULL, NULL, angle, NULL, SDL_FLIP_NONE);
++                    }
++                }
++                SDL_RenderPresent(rotRenderer);
++            }
++        } else if (nextFb && scr) {
++            SDL_BlitSurface(nextFb, NULL, scr, NULL);
++            SDL_UpdateWindowSurface(window);
++        }
+     }
+ #endif
+ #if defined(ENABLE_LEGACY_GL) || defined(ENABLE_MODERN_GL)
+@@ -451,6 +532,70 @@ static void mapSdl2ToGml(SDL_GameController* gc, GamepadSlot* slot) {
+ }
+ 
+ bool platformHandleEvents(void) {
++    // A30 physical buttons are keyboard events on gpio-keys-polled (event3).
++    // The virtual SDL joystick on event4 does not carry them, so feed them to
++    // RunnerKeyboard directly, the same way Spruce emulators read this device.
++    if (a30KeyFd >= 0 && g_runner && g_runner->keyboard) {
++        struct input_event ev;
++        while (read(a30KeyFd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
++            // Physical Menu/Esc: long press quits the game back to SpruceOS.
++            if (ev.type == EV_KEY && ev.code == 1) {
++                if (ev.value == 1) { escHeld = true; escDownAt = SDL_GetTicks(); }
++                else if (ev.value == 0) { escHeld = false; escDownAt = 0; }
++                continue;
++            }
++            int gml = 0;
++            if (ev.type == EV_KEY) {
++                switch (ev.code) {
++                    case 103: gml = VK_UP;    break;
++                    case 108: gml = VK_DOWN;  break;
++                    case 105: gml = VK_LEFT;  break;
++                    case 106: gml = VK_RIGHT; break;
++                    case 57:  gml = 90;       break; /* A -> Z (confirm) */
++                    case 29:  gml = 88;       break; /* B -> X (cancel) */
++                    case 42:  gml = 88;       break; /* X -> X (cancel) */
++                    case 56:  gml = 67;       break; /* Y -> C (game menu) */
++                    case 28:  gml = VK_ENTER; break; /* Start -> Enter */
++                    default: break;
++                }
++            }
++            if (!gml) continue;
++            if (ev.value == 1 || ev.value == 2)
++                RunnerKeyboard_simulatePress(g_runner->keyboard, gml);
++            else if (ev.value == 0)
++                RunnerKeyboard_simulateRelease(g_runner->keyboard, gml);
++        }
++    }
++    // Analog stick on MIYOO Pad1 (event4): axes 16/17 report -1/0/1.
++    // Feed transitions only, so holding a direction does not re-trigger it.
++    if (a30StickFd >= 0 && g_runner && g_runner->keyboard) {
++        struct input_event ev;
++        while (read(a30StickFd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
++            if (ev.type != EV_ABS || (ev.code != 16 && ev.code != 17)) continue;
++            int *state = (ev.code == 16) ? &stickX : &stickY;
++            int prev = *state;
++            *state = ev.value;
++            if (prev == ev.value) continue;
++            int prevKey = 0, nextKey = 0;
++            if (ev.code == 16) {
++                prevKey = prev < 0 ? VK_LEFT : prev > 0 ? VK_RIGHT : 0;
++                nextKey = ev.value < 0 ? VK_LEFT : ev.value > 0 ? VK_RIGHT : 0;
++            } else {
++                prevKey = prev < 0 ? VK_UP : prev > 0 ? VK_DOWN : 0;
++                nextKey = ev.value < 0 ? VK_UP : ev.value > 0 ? VK_DOWN : 0;
++            }
++            if (prevKey && prevKey != nextKey) RunnerKeyboard_simulateRelease(g_runner->keyboard, prevKey);
++            if (nextKey && nextKey != prevKey) RunnerKeyboard_simulatePress(g_runner->keyboard, nextKey);
++        }
++    }
++    if (escHeld && escDownAt && SDL_GetTicks() - escDownAt >= 1000) {
++        SDL_Event quitEvent = {0};
++        quitEvent.type = SDL_QUIT;
++        SDL_PushEvent(&quitEvent);
++        escHeld = false;
++        escDownAt = 0;
++    }
++
+     SDL_Event e;
+     while (SDL_PollEvent(&e)) {
+         switch (e.type) {
+@@ -573,6 +718,23 @@ bool platformHandleEvents(void) {
+         }
+     }
+ 
++    // A30: Undertale polls keyboard keys; inject gamepad buttons as keys
++    // because no 32-bit gptokeyb is available on this firmware.
++    {
++        static bool kbPrev[7] = {false, false, false, false, false, false, false};
++        SDL_GameController *gc = openControllers[0];
++        if (gc && SDL_GameControllerGetAttached(gc)) {
++            const int btns[7] = {12, 13, 14, 15, 0, 1, 9};
++            const int keys[7] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, 90, 88, VK_ENTER};
++            for (int i = 0; i < 7; i++) {
++                bool down = SDL_GameControllerGetButton(gc, (SDL_GameControllerButton)btns[i]) != 0;
++                if (down && !kbPrev[i]) RunnerKeyboard_simulatePress(g_runner->keyboard, keys[i]);
++                if (!down && kbPrev[i]) RunnerKeyboard_simulateRelease(g_runner->keyboard, keys[i]);
++                kbPrev[i] = down;
++            }
++        }
++    }
++
+     return false;
+ }
+ 
+diff --git a/src/runner_gamepad.c b/src/runner_gamepad.c
+index afb4047..cbee04e 100644
+--- a/src/runner_gamepad.c
++++ b/src/runner_gamepad.c
+@@ -32,7 +32,7 @@ int RawToGPUndertale(int32_t gmlButton) {
+ }
+ 
+ static int gmlButtonToIndex(int32_t gmlButton) {
+-    gmlButton = RawToGPDelta(gmlButton);
++    gmlButton = RawToGPUndertale(gmlButton);
+     switch (gmlButton) {
+         case GP_FACE1: return 0;
+         case GP_FACE2: return 1;
+diff --git a/src/sw/defines.h b/src/sw/defines.h
+index af6c242..8c3072a 100644
+--- a/src/sw/defines.h
++++ b/src/sw/defines.h
+@@ -8,8 +8,8 @@
+ // 32-bit: 0xAARRGGBB
+ // 16-bit: 0b0RRRRRGGGGGBBBBB
+ // 8-bit:  0bBBGGGRRR
+-//#define PIXEL_SIZE 32
+-#define PIXEL_SIZE 16
++#define PIXEL_SIZE 32
++//#define PIXEL_SIZE 16
+ //#define PIXEL_SIZE 8
+ 
+ #if defined(__GNUC__) && (__GNUC__ >= 3 || (__GNUC__ == 2 && __GNUC_MINOR__ >= 96))
